@@ -1,0 +1,249 @@
+name: IncidentFox Telemetry Agent
+
+on:
+  pull_request:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  suggest:
+    name: Analyze PR for new services
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Find new services in PR
+        id: detect
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            const newServices = new Set();
+            for await (const { data: files } of github.paginate.iterator(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number, per_page: 100 }
+            )) {
+              for (const f of files) {
+                if (f.status === "added") {
+                  const m = f.filename.match(/^src\/([^/]+)\/Dockerfile$/);
+                  if (m) newServices.add(m[1]);
+                }
+              }
+            }
+
+            core.setOutput("services", JSON.stringify(Array.from(newServices)));
+
+      - name: Comment suggestion
+        if: steps.detect.outputs.services != '[]'
+        uses: actions/github-script@v8
+        env:
+          SERVICES_JSON: ${{ steps.detect.outputs.services }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const services = JSON.parse(process.env.SERVICES_JSON || "[]");
+            const lines = services.map(s => `- \`${s}\``).join("\n");
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = pr.number;
+
+            const marker = "<!-- incidentfox-telemetry-agent -->";
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            )) {
+              if (comments.some(c => (c.body || "").includes(marker))) {
+                core.info("Suggestion comment already exists; skipping.");
+                return;
+              }
+            }
+
+            const body = [
+              marker,
+              "### 🔍 IncidentFox Telemetry Agent",
+              "",
+              "I analyzed this PR and detected **new service(s)** being introduced:",
+              "",
+              lines,
+              "",
+              "These services don't have any observability set up yet — no dashboards, no alerts, no SLOs.",
+              "",
+              "I can automatically generate:",
+              "- ✅ Grafana APM dashboard (request rate, error rate, latency P95/P99)",
+              "- ✅ Service dependency mapping",
+              "- ✅ Log aggregation panels",
+              "",
+              "Reply **go** to this comment and I'll generate everything and push it to this PR.",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pr.number,
+              body,
+            });
+
+  generate_dashboards:
+    name: Generate observability artifacts
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request != null
+      && contains(github.event.comment.body, 'go')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate commenter is trusted
+        id: auth
+        shell: bash
+        run: |
+          assoc="${AUTHOR_ASSOCIATION}"
+          case "$assoc" in
+            OWNER|MEMBER|COLLABORATOR) echo "ok=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "ok=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+        env:
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+
+      - name: React to comment
+        if: steps.auth.outputs.ok == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: "rocket",
+            });
+
+      - name: Get PR details
+        id: pr
+        if: steps.auth.outputs.ok == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number,
+            });
+            core.setOutput("head_ref", pr.data.head.ref);
+            core.setOutput("number", pr.data.number);
+
+      - name: Detect new services
+        id: detect
+        if: steps.auth.outputs.ok == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.issue.number;
+
+            const newServices = new Set();
+            for await (const { data: files } of github.paginate.iterator(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number, per_page: 100 }
+            )) {
+              for (const f of files) {
+                if (f.status === "added") {
+                  const m = f.filename.match(/^src\/([^/]+)\/Dockerfile$/);
+                  if (m) newServices.add(m[1]);
+                }
+              }
+            }
+
+            const services = Array.from(newServices);
+            core.setOutput("services", JSON.stringify(services));
+            if (services.length === 0) {
+              core.info("No new services detected.");
+            }
+
+      - name: Checkout PR branch
+        if: steps.auth.outputs.ok == 'true' && steps.detect.outputs.services != '[]'
+        uses: actions/checkout@v6.0.1
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Generate observability dashboards
+        if: steps.auth.outputs.ok == 'true' && steps.detect.outputs.services != '[]'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x incidentfox/scripts/telemetry-agent/generate-grafana-dashboard.sh
+          services='${{ steps.detect.outputs.services }}'
+          echo "$services" | jq -r '.[]' | while read -r svc; do
+            out="src/grafana/provisioning/dashboards/demo/${svc}-apm-dashboard.json"
+            if [[ -f "$out" ]]; then
+              echo "Already exists, skipping: $out"
+              continue
+            fi
+            incidentfox/scripts/telemetry-agent/generate-grafana-dashboard.sh "$svc"
+          done
+
+      - name: Commit and push
+        if: steps.auth.outputs.ok == 'true' && steps.detect.outputs.services != '[]'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "incidentfox[bot]"
+          git config user.email "bot@incidentfox.ai"
+
+          git add src/grafana/provisioning/dashboards/demo/*-apm-dashboard.json || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(observability): generate APM dashboards for new services
+
+          Auto-generated by IncidentFox Telemetry Agent"
+          git push
+
+      - name: Comment result
+        if: steps.auth.outputs.ok == 'true' && steps.detect.outputs.services != '[]'
+        uses: actions/github-script@v8
+        env:
+          SERVICES_JSON: ${{ steps.detect.outputs.services }}
+        with:
+          script: |
+            const services = JSON.parse(process.env.SERVICES_JSON || "[]");
+            const files = services.map(s =>
+              `- \`src/grafana/provisioning/dashboards/demo/${s}-apm-dashboard.json\``
+            ).join("\n");
+
+            const body = [
+              "### ✅ IncidentFox Telemetry Agent",
+              "",
+              "Done! I generated and pushed the following dashboards to this PR:",
+              "",
+              files,
+              "",
+              "Each dashboard includes:",
+              "- Request rate, error rate, and latency (P95/P99)",
+              "- HTTP and gRPC operation breakdowns",
+              "- Outbound service and database dependency tracking",
+              "- Log aggregation panels",
+              "",
+              "Merge this PR and Grafana will pick them up automatically via provisioning.",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body,
+            });
