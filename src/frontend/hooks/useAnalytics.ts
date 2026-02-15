@@ -10,3 +10,4 @@ export function usePageView(pageName: string) {
 export function useButtonClick(buttonId: string) {
   return () => trackEvent('button_clicked', { button_id: buttonId });
 }
+// Trigger e2e test - 20260215064920
