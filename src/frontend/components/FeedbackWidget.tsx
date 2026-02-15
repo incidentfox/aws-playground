@@ -59,3 +59,4 @@ export const FeedbackWidget: React.FC<FeedbackWidgetProps> = ({ productId, userI
     </form>
   );
 };
+// v2
