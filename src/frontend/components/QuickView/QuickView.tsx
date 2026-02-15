@@ -121,3 +121,4 @@ const QuickView = ({ productId, isOpen, onClose }: QuickViewProps) => {
 };
 
 export default QuickView;
+
