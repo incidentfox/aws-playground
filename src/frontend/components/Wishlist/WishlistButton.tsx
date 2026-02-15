@@ -72,3 +72,4 @@ const WishlistButton = ({ productId, productName }: WishlistButtonProps) => {
 };
 
 export default WishlistButton;
+// Trigger telemetry review bot test
